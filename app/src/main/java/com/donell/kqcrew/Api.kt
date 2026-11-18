@@ -66,6 +66,20 @@ data class DispatchTransit(
 )
 data class DispatchList(val total: Int, val items: List<DispatchTransit>)
 
+// GPS: the position the crew phone sends, and the last known positions the dispatcher reads.
+data class LocationBody(val latitude: Double, val longitude: Double, val accuracy_m: Double?)
+data class CrewLocation(
+    val transit_id: Int,
+    val corridor: String?,
+    val crew_name: String?,
+    val latitude: Double,
+    val longitude: Double,
+    val accuracy_m: Double?,
+    val recorded_at: String?,
+    val arrived: Boolean
+)
+data class LocationList(val total: Int, val items: List<CrewLocation>)
+
 interface KqApi {
     @POST("login")
     suspend fun login(@Body body: LoginBody): Response<LoginResult>
@@ -91,6 +105,12 @@ interface KqApi {
 
     @POST("api/my-transits/{id}/arrived")
     suspend fun arrived(@Path("id") id: Int): Response<Checklist>
+
+    @POST("api/my-transits/{id}/location")
+    suspend fun postLocation(@Path("id") id: Int, @Body body: LocationBody): Response<Unit>
+
+    @GET("api/crew-locations")
+    suspend fun crewLocations(@Query("max_age_minutes") maxAgeMinutes: Int): Response<LocationList>
 
     @GET("api/transits")
     suspend fun dispatchTransits(

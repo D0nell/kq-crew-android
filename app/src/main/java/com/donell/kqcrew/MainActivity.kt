@@ -1,9 +1,19 @@
 package com.donell.kqcrew
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Bundle
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,6 +39,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,13 +55,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
+import androidx.credentials.GetCredentialResponse
+import androidx.core.content.ContextCompat
+import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import com.donell.kqcrew.ui.theme.KQCrewTheme
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import java.util.Locale
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import retrofit2.Response
@@ -76,6 +93,7 @@ fun App() {
     var transits by remember { mutableStateOf<List<Transit>>(emptyList()) }
     var dispatchItems by remember { mutableStateOf<List<DispatchTransit>>(emptyList()) }
     var dispatchFilter by remember { mutableStateOf(0) }
+    var locations by remember { mutableStateOf<List<CrewLocation>>(emptyList()) }
     var openTransit by remember { mutableStateOf<Transit?>(null) }
     var openDispatch by remember { mutableStateOf<DispatchTransit?>(null) }
     var message by remember { mutableStateOf("") }
@@ -150,32 +168,59 @@ fun App() {
             busy = true
             message = ""
             try {
-                val option = GetGoogleIdOption.Builder()
-                    .setFilterByAuthorizedAccounts(false)
-                    .setServerClientId(WEB_CLIENT_ID)
-                    .build()
+                val manager = CredentialManager.create(context)
+                // Forget any earlier Google sign-in state so a second sign-in in the same session starts clean.
+                try {
+                    manager.clearCredentialState(ClearCredentialStateRequest())
+                } catch (e: Exception) {
+                    // Nothing to clear, carry on.
+                }
+                val option = GetSignInWithGoogleOption.Builder(WEB_CLIENT_ID).build()
                 val request = GetCredentialRequest.Builder().addCredentialOption(option).build()
-                val result = CredentialManager.create(context).getCredential(context, request)
-                val credential = result.credential
-                if (credential is CustomCredential &&
-                    credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
-                ) {
-                    val idToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
-                    val login = KqClient.api.googleLogin(GoogleBody(idToken, role))
-                    if (!login.isSuccessful) {
-                        message = when (login.code()) {
-                            403 -> errorDetail(login) ?: "This Google account cannot sign in here."
-                            503 -> "Google sign-in is not set up on the server."
-                            else -> "Google sign-in was refused (HTTP ${login.code()})."
-                        }
+                var result: GetCredentialResponse? = null
+                var failure: GetCredentialException? = null
+                // Try twice: the first try can fail while Google Play services is still waking up.
+                for (attempt in 1..2) {
+                    try {
+                        result = manager.getCredential(context, request)
+                        failure = null
+                        break
+                    } catch (e: GetCredentialCancellationException) {
+                        failure = e
+                        break // The person closed the sheet, so do not try again.
+                    } catch (e: GetCredentialException) {
+                        failure = e
+                        delay(1000)
+                    }
+                }
+                val response = result
+                if (response == null) {
+                    message = if (failure is GetCredentialCancellationException) {
+                        "Google sign-in was cancelled."
                     } else {
-                        finishSignIn(login.body()?.role)
+                        "Google sign-in failed (" + (failure?.javaClass?.simpleName ?: "unknown") +
+                                "). Tap Continue with Google again, or sign in with your password."
                     }
                 } else {
-                    message = "Google sign-in is not available on this device."
+                    val credential = response.credential
+                    if (credential is CustomCredential &&
+                        credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+                    ) {
+                        val idToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
+                        val login = KqClient.api.googleLogin(GoogleBody(idToken, role))
+                        if (!login.isSuccessful) {
+                            message = when (login.code()) {
+                                403 -> errorDetail(login) ?: "This Google account cannot sign in here."
+                                503 -> "Google sign-in is not set up on the server."
+                                else -> "Google sign-in was refused (HTTP ${login.code()})."
+                            }
+                        } else {
+                            finishSignIn(login.body()?.role)
+                        }
+                    } else {
+                        message = "Google sign-in is not available on this device."
+                    }
                 }
-            } catch (e: GetCredentialException) {
-                message = "Google sign-in was cancelled, or no Google account is set up on this device."
             } catch (e: Exception) {
                 message = "Cannot reach the server. Check that the API is running."
             }
@@ -188,7 +233,17 @@ fun App() {
             busy = true
             message = ""
             try {
-                if (signedInRole == "DISPATCHER") {
+                if (signedInRole == "DISPATCHER" && dispatchFilter == 3) {
+                    val list = KqClient.api.crewLocations(120)
+                    if (list.code() == 401) {
+                        signedInName = null
+                        message = "Your session ended. Please sign in again."
+                    } else if (list.isSuccessful) {
+                        locations = list.body()?.items ?: emptyList()
+                    } else {
+                        message = "Could not load positions (HTTP ${list.code()})."
+                    }
+                } else if (signedInRole == "DISPATCHER") {
                     val list = loadDispatch(dispatchFilter)
                     if (list.code() == 401) {
                         signedInName = null
@@ -228,11 +283,17 @@ fun App() {
             } catch (e: Exception) {
                 // Signing out locally is enough if the server cannot be reached.
             }
+            try {
+                CredentialManager.create(context).clearCredentialState(ClearCredentialStateRequest())
+            } catch (e: Exception) {
+                // Nothing to clear.
+            }
             signedInName = null
             openTransit = null
             openDispatch = null
             transits = emptyList()
             dispatchItems = emptyList()
+            locations = emptyList()
             message = ""
         }
     }
@@ -254,7 +315,7 @@ fun App() {
                     DispatchDetailScreen(openDisp) { openDispatch = null }
                 } else {
                     DispatcherScreen(
-                        who, dispatchItems, dispatchFilter, busy, message,
+                        who, dispatchItems, locations, dispatchFilter, busy, message,
                         { selectFilter(it) }, { refresh() }, { signOut() }, { openDispatch = it }
                     )
                 }
@@ -425,7 +486,8 @@ fun TransitCard(t: Transit, onClick: () -> Unit) {
     }
 }
 
-// The readiness checklist of one transit: three tick boxes and an "I've arrived" button.
+// The readiness checklist of one transit: three tick boxes, location sharing and an "I've arrived" button.
+@SuppressLint("MissingPermission")
 @Composable
 fun ChecklistScreen(
     transit: Transit,
@@ -437,6 +499,10 @@ fun ChecklistScreen(
     var loading by remember { mutableStateOf(true) }
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
+    var sharing by remember { mutableStateOf(false) }
+    var shareStatus by remember { mutableStateOf("") }
+    var lastSent by remember { mutableStateOf(0L) }
+    val context = LocalContext.current
 
     // Shows the server's answer, or the reason there is none.
     fun show(resp: Response<Checklist>) {
@@ -464,6 +530,122 @@ fun ChecklistScreen(
 
     LaunchedEffect(transit.transit_id) {
         send { KqClient.api.checklist(transit.transit_id) }
+    }
+
+    // Sends one position to the server, at most once every ten seconds.
+    fun postFix(loc: Location) {
+        val now = System.currentTimeMillis()
+        if (now - lastSent < 10_000) return
+        lastSent = now
+        scope.launch {
+            try {
+                val accuracy = if (loc.hasAccuracy()) loc.accuracy.toDouble() else null
+                val resp = KqClient.api.postLocation(
+                    transit.transit_id,
+                    LocationBody(loc.latitude, loc.longitude, accuracy)
+                )
+                when {
+                    resp.code() == 401 -> {
+                        sharing = false
+                        onSessionEnded()
+                    }
+                    resp.code() == 409 -> {
+                        sharing = false
+                        shareStatus = "This transit is complete. Location sharing stopped."
+                    }
+                    resp.isSuccessful -> shareStatus = "Location shared. Last update sent just now."
+                    else -> shareStatus = "Could not share the location (HTTP ${resp.code()})."
+                }
+            } catch (e: Exception) {
+                shareStatus = "Cannot reach the server. Will keep trying."
+            }
+        }
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        if (result.values.any { it }) {
+            sharing = true
+        } else {
+            shareStatus = "Location permission was refused, so sharing cannot start."
+        }
+    }
+
+    fun startSharing() {
+        shareStatus = ""
+        val fine = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (fine || coarse) {
+            sharing = true
+        } else {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    // While sharing is on, listen to the phone's location sources; stop when it is turned off
+    // or when this screen is closed.
+    DisposableEffect(sharing) {
+        var manager: LocationManager? = null
+        var listener: LocationListener? = null
+        if (sharing) {
+            val m = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val l = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    postFix(location)
+                }
+
+                override fun onProviderEnabled(provider: String) {}
+
+                override fun onProviderDisabled(provider: String) {}
+
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            }
+            var registered = 0
+            for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                try {
+                    if (m.isProviderEnabled(provider)) {
+                        m.requestLocationUpdates(provider, 5000L, 0f, l, Looper.getMainLooper())
+                        registered++
+                    }
+                } catch (e: Exception) {
+                    // This source is not allowed or not available; try the next one.
+                }
+            }
+            if (registered == 0) {
+                shareStatus = "No location source is available. Turn on Location in the phone settings."
+                sharing = false
+            } else {
+                manager = m
+                listener = l
+                shareStatus = "Waiting for a location fix..."
+            }
+        }
+        onDispose {
+            val m2 = manager
+            val l2 = listener
+            if (m2 != null && l2 != null) {
+                m2.removeUpdates(l2)
+            }
+        }
+    }
+
+    // Once arrival is confirmed the transit is complete and sharing stops.
+    LaunchedEffect(checklist?.arrived) {
+        if (checklist?.arrived == true) {
+            sharing = false
+            shareStatus = ""
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
@@ -504,6 +686,19 @@ fun ChecklistScreen(
                     Text(task.label, style = MaterialTheme.typography.bodyLarge)
                 }
             }
+            if (!current.arrived) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { if (sharing) sharing = false else startSharing() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (sharing) "Stop sharing my location" else "Share my location")
+                }
+                if (shareStatus.isNotEmpty()) {
+                    Text(shareStatus, style = MaterialTheme.typography.bodySmall)
+                }
+                Text("Sharing works while this screen is open.", style = MaterialTheme.typography.bodySmall)
+            }
             Spacer(Modifier.height(16.dp))
             if (current.arrived) {
                 Text(
@@ -529,6 +724,7 @@ fun ChecklistScreen(
 fun DispatcherScreen(
     name: String,
     rows: List<DispatchTransit>,
+    locations: List<CrewLocation>,
     filter: Int,
     busy: Boolean,
     message: String,
@@ -537,7 +733,7 @@ fun DispatcherScreen(
     onSignOut: () -> Unit,
     onOpen: (DispatchTransit) -> Unit
 ) {
-    val labels = listOf("Next up", "Highest risk", "Alerts")
+    val labels = listOf("Next up", "Risk", "Alerts", "Live")
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
@@ -563,7 +759,18 @@ fun DispatcherScreen(
             Text(message, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
         }
         Spacer(Modifier.height(8.dp))
-        if (rows.isEmpty()) {
+        if (filter == 3) {
+            if (locations.isEmpty()) {
+                Text(
+                    "No crew member has shared a position in the last two hours.",
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(locations, key = { it.transit_id }) { l -> CrewLocationCard(l) }
+                }
+            }
+        } else if (rows.isEmpty()) {
             Text("No transits match this view.", style = MaterialTheme.typography.bodyLarge)
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -597,6 +804,35 @@ fun DispatchCard(t: DispatchTransit, onClick: () -> Unit) {
                 if (t.open_alert) {
                     Text("   Alert", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
                 }
+            }
+        }
+    }
+}
+
+// The last known position of one transit, with a button that opens it in Maps.
+@Composable
+fun CrewLocationCard(l: CrewLocation) {
+    val uriHandler = LocalUriHandler.current
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                (l.crew_name ?: "Crew member") + "  #" + l.transit_id,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(l.corridor ?: "-", style = MaterialTheme.typography.bodyMedium)
+            Text("Last seen " + agoText(l.recorded_at), style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "Position: " + String.format(Locale.US, "%.5f", l.latitude) + ", " +
+                        String.format(Locale.US, "%.5f", l.longitude),
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (l.arrived) {
+                Text("Arrived", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { uriHandler.openUri(mapsUrl(l.latitude, l.longitude)) }) {
+                Text("Open in Maps")
             }
         }
     }
@@ -657,6 +893,26 @@ fun filterParams(index: Int): Pair<String, String> = when (index) {
     1 -> Pair("probability", "scored")
     2 -> Pair("probability", "alert")
     else -> Pair("pickup_time", "all")
+}
+
+// A web link that shows this position on a map, in Maps or in the browser.
+fun mapsUrl(lat: Double, lon: Double): String =
+    "https://www.google.com/maps/search/?api=1&query=" + lat + "," + lon
+
+// "just now", "5 min ago" or "2 h ago" for a server timestamp.
+fun agoText(iso: String?): String {
+    if (iso == null) return "-"
+    return try {
+        val then = java.time.OffsetDateTime.parse(iso).toInstant()
+        val secs = java.time.Duration.between(then, java.time.Instant.now()).seconds
+        when {
+            secs < 60 -> "just now"
+            secs < 3600 -> (secs / 60).toString() + " min ago"
+            else -> (secs / 3600).toString() + " h ago"
+        }
+    } catch (e: Exception) {
+        formatTime(iso)
+    }
 }
 
 fun percentText(p: Double?): String = if (p == null) "" else "  " + (p * 100).toInt() + "%"
